@@ -9,24 +9,27 @@ from regexulator.evaluator import eval_pattern
 
 
 class RegexulatorExplorer:
-    def __init__(self, train, task_type, cfg, random_state=None,
-                 priority=None, initial_regex=None, validation_feedback=None):
+    def __init__(self, train, task_type, cfg, name, random_state=None,
+                 initial_pattern=None, validation_feedback=None):
+        self.state = "init"
+        
         self.train=train
         self.task_type = task_type
-        self.priority = priority
         self.cfg = cfg
         self.random_state = random_state if random_state is not None else random.randint(0, 1000000)
 
         # tree info
+        self.name = name
+        self.priority = None
         self.depth = None
         self.parent = None
         self.children = []
 
         # results
-        self.regex = None
+        self.pattern = None
         self.metrics_train = None
         self.metrics_val = None
-        self.state = None
+        
         # "queued" | "running" | "interrupted" | "finished" | "failed"
         self.fail_reason = None
         self.log = RegexulatorExplorerLog()
@@ -41,6 +44,9 @@ class RegexulatorExplorer:
         else:
             raise ValueError("Elements of train should have `text` or `string` key.")
 
+    def __lt__(self, other):
+        return False
+
     def run(self):
         self.state = "running"
         if self.task_type == "start":
@@ -54,13 +60,13 @@ class RegexulatorExplorer:
         messages.append(msg_assistant(response))
         pattern = self.extract_regex(response)
 
-        self.regex = pattern
+        self.pattern = pattern
         self.metrics_train = eval_pattern(self.train, pattern)
-        self.primary_metric = "char_f1"
+        
         if self.metrics_train is None:
             self.log.events.append(("info", f"first_guess: new pattern not compilable: `{pattern}`"))
         else:
-            self.log.events.append(("info", f"first_guess: pattern ok: {self.primary_metric}={self.metrics_train[self.primary_metric]:.3f} `{pattern}`"))
+            self.log.events.append(("info", f"first_guess: pattern ok: {self.cfg.primary_metric}={self.metrics_train[self.cfg.primary_metric]:.3f} `{pattern}`"))
         
         passed = 0
         while True:
@@ -97,8 +103,23 @@ class RegexulatorExplorer:
         )
         return prompt
 
-    def pattern_improvement(self, new_pattern, metric="char_f1"):
+    def fail(self, exception):
+        # print("f1", flush=True)
+        old_state = self.state
+        if self.fail_reason:
+            self.fail_reason += "\n"
+        else:
+            self.fail_reason = ""
+        # print("f2", flush=True)
+        self.fail_reason += f"exception in {old_state}: {repr(exception)}"
+        self.state = "failed"
+        # print("f3", flush=True)
+
+    
+    def pattern_improvement(self, new_pattern, metric=None):
         new_metrics = eval_pattern(self.train, new_pattern)
+        if metric is None:
+            metric = self.cfg.primary_metric
         if new_metrics is None:
             self.log.events.append(("info", f"pattern_improvement: new pattern not compilable: `{new_pattern}`"))
             return
@@ -107,7 +128,7 @@ class RegexulatorExplorer:
                 self.log.events.append(("info", f"pattern_improvement: new pattern is compilable: {metric}={new_metrics[metric]:.3f} `{new_pattern}`"))
             else:
                 self.log.events.append(("info", f"pattern_improvement: new pattern better at {metric}: {new_metrics[metric]:.3f} > {self.metrics_train[metric]:3f} `{new_pattern}`"))
-            self.regex = new_pattern
+            self.pattern = new_pattern
             self.metrics_train = new_metrics
         else:
             self.log.events.append(("info", f"pattern_improvement: new pattern worse at {metric}: {new_metrics[metric]:.3f} < {self.metrics_train[metric]:3f} `{new_pattern}`"))
