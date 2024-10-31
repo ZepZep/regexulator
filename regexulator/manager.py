@@ -1,20 +1,23 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import queue
+import random
 import threading
 import time
-import random
-import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from typing import Optional
 
 import pandas as pd
 
-from regexulator.explorer import RegexulatorExplorer
-from regexulator.evaluator import eval_pattern
+from .config import RegexulatorConfig
+from .explorer import RegexulatorExplorer
+from .evaluator import eval_pattern 
 
 class Regexulator:
-    def __init__(self, cfg):
+    def __init__(self, cfg:Optional[RegexulatorConfig]=None, **kwargs):
+        if cfg is None:
+            cfg = RegexulatorConfig(**kwargs)
         self.cfg = cfg
-        start_time = time.time()
-        self.timeout_time = None if cfg.time_limit is None else start_time + cfg.time_limit
 
         self.cur_random = cfg.random_state if cfg.random_state is not None else random.randint(0, 1000000)
 
@@ -24,7 +27,11 @@ class Regexulator:
         if self.fit_called:
             raise Exception("fit was already called")
         self.fit_called = True
+        
         cfg = self.cfg
+        self.start_time = time.time()
+        self.timeout_time = None if cfg.time_limit is None else self.start_time + cfg.time_limit
+        
         self.train, self.val, self.test =  self.split_dataset(dataset, cfg.random_state)
         self.random_lock = threading.Lock()
         self.eval_lock = threading.Lock()
@@ -43,7 +50,7 @@ class Regexulator:
         initial_priority = 10
         with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
             try:
-                print("exec start")
+                # print("exec start")
                 futures = []
                 for wid in range(cfg.workers):
                     futures.append(executor.submit(self.work, wid))
@@ -54,7 +61,7 @@ class Regexulator:
                         self.train, "start", cfg,
                         name=str(i), random_state=self.next_rs()
                     )
-                    explorer.depth = 0
+                    explorer.depth = 1
                     explorer.priority = initial_priority
                     self.initial.append(explorer)
                     self.task_queue.put((-initial_priority, explorer))
@@ -62,7 +69,7 @@ class Regexulator:
 
 
                 self.task_queue.join()
-                print("exec joined")
+                # print("exec joined")
 
             except Exception as e:
                 print(f"Exception in Manager: {e}")
@@ -76,9 +83,12 @@ class Regexulator:
                 result = future.result()
     
 
-            print("exec end")           
+            # print("exec end")           
 
-        print("exec exited")
+        # print("exec exited")
+        self.end_time = time.time()
+        self.time = self.end_time - self.start_time
+        return self.pattern
 
     def work(self, wid):
         # with self.print_lock: print(f"{wid=} started")
@@ -124,7 +134,10 @@ class Regexulator:
         self.eval_explorer(explorer)
         if explorer.depth >= self.cfg.max_depth:
             return
-        parent_metric = explorer.metrics_val[self.cfg.primary_metric]
+        if explorer.metrics_val is not None:
+            parent_metric = explorer.metrics_val[self.cfg.primary_metric]
+        else:
+            parent_metric = 0
         for i in range(self.cfg.branching):
             child = RegexulatorExplorer(
                 self.train, "improve", self.cfg,
@@ -146,7 +159,11 @@ class Regexulator:
         return rs
 
     def eval_explorer(self, explorer, metric=None):
-        new_metrics = eval_pattern(self.val, explorer.pattern)
+        if self.val:
+            new_metrics = eval_pattern(self.val, explorer.pattern)
+        else:
+            # use train metric
+            new_metrics = explorer.metrics_train
         explorer.metrics_val = new_metrics
         if metric is None:
             metric = self.cfg.primary_metric
@@ -161,6 +178,7 @@ class Regexulator:
                 # else:
                 #     self.log.events.append(("info", f"pattern_improvement: new pattern better at {metric}: {new_metrics[metric]:.3f} > {self.metrics_train[metric]:3f} `{new_pattern}`"))
                 self.best_explorer = explorer
+                self.pattern = explorer.pattern
             else:
                 pass
             # self.log.events.append(("info", f"pattern_improvement: new pattern worse at {metric}: {new_metrics[metric]:.3f} < {self.metrics_train[metric]:3f} `{new_pattern}`"))
@@ -191,6 +209,25 @@ class Regexulator:
         parts.append("}")
         return "\n".join(parts)
 
+    def show_dot(self):
+        import graphviz
+        return graphviz.Source(self.to_dot())
+
+    def to_dict(self):
+        return {
+            "cfg": self.cfg._asdict(),
+            "time": self.time,
+            "best_explorer": None if self.best_explorer is None else self.best_explorer.to_dict(children=False),
+            "best_explorer_id": id(self.best_explorer),
+            "pattern": self.pattern,
+            "metrics_train": self.metrics_train,
+            "metrics_val": self.metrics_val,
+            "metrics_test": self.metrics_test,
+            "dot": self.to_dot(),
+            "nodes": [explorer.to_dict(children=True) for explorer in self.initial],
+        }
+        pass
+
     def split_dataset(self, dataset, random_state=None):
         cfg = self.cfg
         dataset = list(dataset)
@@ -216,7 +253,7 @@ class Regexulator:
             tm = "-" if node.metrics_train is None else node.metrics_train[self.cfg.primary_metric]
             vm = "-" if node.metrics_val is None else node.metrics_val[self.cfg.primary_metric]
             fillcolor = get_color_scale(vm, BG_SCALE_METRIC)
-            label = f"{pattern}|{{{{{'train_'+self.cfg.primary_metric}|{'val_'+self.cfg.primary_metric}}}|{{{tm:.3f}|{vm:.3f}}}|{{not_compile|self_revise}}|{{{node.log.n_not_compilable}|{node.log.n_self_revised}}}}}"
+            label = f"{pattern}|{{{{{'train_'+self.cfg.primary_metric}|{'val_'+self.cfg.primary_metric}}}|{{{m_to_str(tm)}|{m_to_str(vm)}}}|{{not_compile|self_revise}}|{{{node.log.n_not_compilable}|{node.log.n_self_revised}}}}}"
             return f"""  "{node.name}" [shape=record, style=filled fillcolor="{fillcolor}" label="{label}"]
   "{parent}" ->  "{node.name}"
 """
@@ -226,9 +263,13 @@ class Regexulator:
   "{parent}" ->  "{node.name}"
 """
 
+def m_to_str(m):
+    if type(m) == str:
+        return m
+    return f"{m:.3f}"
 
 def record_escape(text):
-    return text.replace("\\", "\\\\").replace("|", "\\|").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\n")
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\n").replace("<", "\\<").replace(">", "\\>")
 
 BG_SCALE_METRIC = [
     (0.4, "#F6B26B"),
@@ -240,6 +281,8 @@ BG_SCALE_METRIC = [
     (1.0, "#6AA74F"),
 ]
 def get_color_scale(val, scale):
+    if type(val) == str:
+        return scale[0][1]
     for tr, color in scale:
         if tr > val:
             return color

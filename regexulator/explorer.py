@@ -1,15 +1,16 @@
 import random
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 import ollama
 import pandas as pd
 
-from regexulator.evaluator import eval_pattern
+from .evaluator import eval_pattern, get_eval_examples
+from .config import RegexulatorConfig
 
 
 class RegexulatorExplorer:
-    def __init__(self, train, task_type, cfg, name, random_state=None,
+    def __init__(self, train, task_type, cfg: RegexulatorConfig, name, random_state=None,
                  initial_pattern=None, validation_feedback=None):
         self.state = "init"
         
@@ -17,6 +18,9 @@ class RegexulatorExplorer:
         self.task_type = task_type
         self.cfg = cfg
         self.random_state = random_state if random_state is not None else random.randint(0, 1000000)
+
+        self.initial_pattern = initial_pattern
+        self.validation_feedback = validation_feedback
 
         # tree info
         self.name = name
@@ -89,19 +93,52 @@ class RegexulatorExplorer:
 
     def make_start_prompt(self):
         train_flat = self._flatten_ds(self.train)
+        to_sample = self.cfg.show_start_examples
+        if len(train_flat) == 0:
+            raise Exception("No start examples")
         if len(train_flat) < self.cfg.show_start_examples:
-            # FIXME
-            pass
-        selected = train_flat.sample(self.cfg.show_start_examples, random_state=self.random_state)
-        examples, extractions = self.make_exa_ext(selected)
-        cheatsheet = "" if not self.cfg.cheatsheet else pattern["cheatsheet"]
+            to_sample = len(train_flat)
+            self.log.events.append(("warn", f"too few start examples: {len(train_flat)} < {self.cfg.show_start_examples} (cfg.show_start_examples)"))
 
-        prompt = self.cfg.prompt_template["start"].format(
+        selected = train_flat.sample(to_sample, random_state=self.random_state)
+        examples, extractions = self.make_exa_ext(selected)
+
+
+        prompt = self.cfg.prompt_templates.start.format(
             examples=examples,
             extractions=extractions,
-            cheatsheet=cheatsheet,
+            cheatsheet=self.get_cheatsheet(),
+            description=self.get_description(),
         )
         return prompt
+
+    def make_improve_prompt(self):
+        if self.initial_pattern is None:
+            raise Exception("Task type is improve but initial pattern is None")
+        train_flat = get_eval_examples(self.train, self.initial_pattern)
+        # print(f"improve vc: {train_flat.type.value_counts().to_dict()}", flush=True)
+
+        tp = self.select_for_improve(train_flat, "exact")
+        fn = self.select_for_improve(train_flat, "miss_gt")
+        fp = self.select_for_improve(train_flat, "miss_pred")
+
+        prompt = self.cfg.prompt_templates.improve.format(
+            pattern=self.initial_pattern,
+            examples_tp=tp[0], extractions_tp=tp[1],
+            examples_fn=fn[0], extractions_fn=fn[1],
+            examples_fp=fp[0], extractions_fp=fp[1],
+            cheatsheet=self.get_cheatsheet(),
+            description=self.get_description(),
+        )
+        return prompt
+
+    def select_for_improve(self, flat, subset):
+        sub = flat.query(f"type == '{subset}'")
+        if len(sub) == 0:
+            return "", ""
+        to_sample = min(self.cfg.show_improve_examples, len(sub))
+        selected = sub.sample(to_sample, random_state=self.random_state)
+        return self.make_exa_ext(selected)
 
     def fail(self, exception):
         # print("f1", flush=True)
@@ -115,6 +152,16 @@ class RegexulatorExplorer:
         self.state = "failed"
         # print("f3", flush=True)
 
+    def get_cheatsheet(self):
+        if not self.cfg.cheatsheet:
+            return ""
+        return self.cfg.prompt_templates.cheatsheet
+
+    def get_description(self):
+        if not self.cfg.natural_description:
+            return ""
+        return f"The expression should match {self.cfg.natural_description}\n"
+        
     
     def pattern_improvement(self, new_pattern, metric=None):
         new_metrics = eval_pattern(self.train, new_pattern)
@@ -136,11 +183,13 @@ class RegexulatorExplorer:
 
     def check_compile(self, messages, pattern):
         try:
+            if not pattern:
+                raise re.error("No pattern found")
             re.compile(pattern)
         except re.error as e:
             print("check_compile triggered")
             self.log.n_not_compilable += 1
-            prompt = self.cfg.prompt_template["not_compilable"].format(error=str(e))
+            prompt = self.cfg.prompt_templates.not_compilable.format(error=str(e))
             messages.append(msg_user(prompt))
             response = self.llm_generate(f"fix_compile-{self.log.n_not_compilable}", messages)
             messages.append(msg_assistant(response))
@@ -150,14 +199,14 @@ class RegexulatorExplorer:
         return True, None
 
     def self_revise(self, messages):
-        new_message = msg_user(self.cfg.prompt_template["self_revise_question"])
+        new_message = msg_user(self.cfg.prompt_templates.self_revise_question)
         response = self.llm_generate(f"self_revise_question-{self.log.n_self_revised}", messages+[new_message])
         if response.lower() == "yes":
             return True, None
         if response.lower() == "no":
             print("self_revise triggered")
             self.log.n_self_revised += 1
-            prompt = self.cfg.prompt_template["self_revise_fix"]
+            prompt = self.cfg.prompt_templates.self_revise_fix
             messages.append(msg_user(prompt))
             response = self.llm_generate(f"self_revise_question-{self.log.n_self_revised}", messages)
             messages.append(msg_assistant(response))
@@ -165,9 +214,6 @@ class RegexulatorExplorer:
             return False, pattern
         else:
             print(f"unknown self_revise response: {response}")
-
-    def make_improve_prompt(self):
-        raise NotImplementedError
 
     def make_exa_ext(self, ds_flat):
         exa = []
@@ -203,16 +249,19 @@ class RegexulatorExplorer:
         return last_break
 
     def llm_generate(self, name, messages):
+        # print(f"GEN S {self.random_state}\n", flush=True, end="")
         e = ollama.chat(
             model=self.cfg.model,
             messages=messages,
             options={
                 "num_ctx": self.cfg.llm_num_ctx,
+                "num_predict": 1024,
                 "temperature": self.cfg.llm_temperature
             },
             keep_alive=self.cfg.llm_keep_alive,
         )
         self.log.conversations.append(make_conversation(name, messages, e))
+        # print(f"GEN F {self.random_state}\n", flush=True, end="")
         return e['message']['content']
 
     def extract_regex(self, response):
@@ -223,8 +272,6 @@ class RegexulatorExplorer:
         # FIXME tags
         return m.group(1).replace("`", "")
 
-    # def to_dot(self, name):
-    #     pass
 
     def _flatten_ds(self, ds):
         return pd.DataFrame.from_records([
@@ -232,6 +279,17 @@ class RegexulatorExplorer:
                 for doc in ds
                 for ann in doc["match"]
         ])
+
+    def to_dict(self, children=True):
+        out = {}
+        for atr in ['task_type', 'initial_pattern', 'validation_feedback',
+                    'name', 'priority', 'depth', 'pattern', 'metrics_train',
+                    'metrics_val', 'fail_reason']:
+            out[atr] = self.__getattribute__(atr)
+        out["log"] = self.log.to_dict()
+        if children:
+            out["children"] = [child.to_dict(children=children) for child in self.children]
+        return out
 
 
 def msg_user(prompt):
@@ -255,7 +313,9 @@ class RegexulatorExplorerLog:
     conversations: list = field(default_factory=list)
     n_not_compilable: int = 0
     n_self_revised: int = 0
-    
+
+    def to_dict(self):
+        return asdict(self)
 
 @dataclass
 class RegexulatorConversation:
@@ -273,12 +333,20 @@ class RegexulatorConversation:
     prompt_eval_duration: float
     eval_duration: float
 
+    def print(self):
+        for d in self.prompt + [self.response]:
+            print(f"\n{d['role']:-^20}\n")
+            print(d["content"])
+
+        # print(f"\n{'assistant':-^20}\n")
+        # print(self.response)
+
 def make_conversation(name, prompt, response):
     stay = ["model", "created_at", "done_reason", "done", "prompt_eval_count", "eval_count"]
     to_float = ['total_duration', 'load_duration', 'prompt_eval_duration', 'eval_duration']
     transformed = {
         "name": name,
-        "prompt": prompt,
+        "prompt": prompt.copy(),
         "response": response["message"],
         ** {k:response[k] for k in stay},
         ** {k:response[k]/1e9 for k in to_float},
