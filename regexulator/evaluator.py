@@ -1,16 +1,17 @@
-import re
+import regex
+import time
 
 import pandas as pd
 import numpy as np
 
-def eval_pattern(ds, pattern):
+def eval_pattern(ds, pattern, cfg):
     if not pattern:
         return None
     try:
-        re.compile(pattern)
-    except re.error as e:
+        regex.compile(pattern)
+    except regex.error as e:
         return None
-    res = pd.DataFrame.from_records(_eval_pattern_raw(ds, pattern))
+    res = pd.DataFrame.from_records(_eval_pattern_raw(ds, pattern, cfg))
     res = res.sum()
     d = {
         f"{subset}_{k}": v
@@ -39,12 +40,13 @@ def calculate_metrics(res, subset):
     }
 
 
-def _eval_pattern_raw(ds, pattern):
+def _eval_pattern_raw(ds, pattern, cfg):
     res = []
     for ex in ds:
         text = ex["string"]
         gt = ex["match"]
-        pred = get_anns(text, pattern)
+        pred = get_anns(text, pattern, cfg)
+        # print(len(pred))
         eres = {
             "match_gt": len(gt),
             "match_pred": len(pred),
@@ -73,12 +75,12 @@ def _eval_pattern_raw(ds, pattern):
         res.append(eres)
     return res
 
-def get_eval_examples(ds, pattern):
+def get_eval_examples(ds, pattern, cfg):
     res = []
     for ex in ds:
         text = ex["string"]
         gt = ex["match"]
-        preds = get_anns(text, pattern)
+        preds = get_anns(text, pattern, cfg)
 
         # types = ["exact", "partial_pred", "partial_gt", "miss_pred", "miss_gt"]
         
@@ -111,12 +113,24 @@ def get_eval_examples(ds, pattern):
 def overlaps(l1, r1, l2, r2): 
     return max(l1, l2) <= min(r1, r2)
 
-def get_anns(text, pattern, group=0):
+def get_anns(text, pattern, cfg, group=0):
+    timeout_time = time.time() + cfg.match_timeout
+    err = None
     anns = []
-    for m in re.finditer(pattern, text):
-        # print(m)
-        ann = {}
-        ann["start"], ann["end"] = m.span(group)
-        anns.append(ann)
+    try:
+        for m in regex.finditer(pattern, text, timeout=cfg.match_timeout):
+            # print(m)
+            ann = {}
+            ann["start"], ann["end"] = m.span(group)
+            anns.append(ann)
+            if len(anns) >= cfg.max_doc_anns:
+                err = "too many annotations"
+                break
+            if time.time() >= timeout_time:
+                err = "timeout"
+                break
+    except TimeoutError:
+        err = "timeout"
+        pass
 
     return anns

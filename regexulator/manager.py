@@ -4,7 +4,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Optional
 
 import pandas as pd
@@ -17,6 +17,11 @@ class Regexulator:
     def __init__(self, cfg:Optional[RegexulatorConfig]=None, **kwargs):
         if cfg is None:
             cfg = RegexulatorConfig(**kwargs)
+        elif kwargs:
+            cfg_d = asdict_non_recursive(cfg)
+            cfg_d.update(kwargs)
+            cfg = RegexulatorConfig(**cfg_d)
+            
         self.cfg = cfg
 
         self.cur_random = cfg.random_state if cfg.random_state is not None else random.randint(0, 1000000)
@@ -138,7 +143,7 @@ class Regexulator:
             parent_metric = explorer.metrics_val[self.cfg.primary_metric]
         else:
             parent_metric = 0
-        for i in range(self.cfg.branching):
+        for i in range(self.cfg.branching_factor):
             child = RegexulatorExplorer(
                 self.train, "improve", self.cfg,
                 name=f"{explorer.name}_{i}",
@@ -301,7 +306,6 @@ def empty_queue(q, reason=None):
     except queue.Empty:
         pass
             
-
-
-class RegexulatorResult:
-    pass
+def asdict_non_recursive(instance):
+    return {f.name: getattr(instance, f.name) for f in fields(instance)}
+    

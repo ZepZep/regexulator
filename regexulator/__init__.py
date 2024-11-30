@@ -1,7 +1,8 @@
-from .config import RegexulatorConfig
+from .config import RegexulatorConfig, RCfg
 from .manager import Regexulator
 
 __all__ = [
     Regexulator,
-    RegexulatorConfig
+    RegexulatorConfig,
+    RCfg
 ]

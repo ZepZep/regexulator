@@ -1,5 +1,5 @@
 import random
-import re
+import regex
 from dataclasses import dataclass, field, asdict
 
 import ollama
@@ -65,7 +65,7 @@ class RegexulatorExplorer:
         pattern = self.extract_regex(response)
 
         self.pattern = pattern
-        self.metrics_train = eval_pattern(self.train, pattern)
+        self.metrics_train = eval_pattern(self.train, pattern, self.cfg)
         
         if self.metrics_train is None:
             self.log.events.append(("info", f"first_guess: new pattern not compilable: `{pattern}`"))
@@ -115,7 +115,7 @@ class RegexulatorExplorer:
     def make_improve_prompt(self):
         if self.initial_pattern is None:
             raise Exception("Task type is improve but initial pattern is None")
-        train_flat = get_eval_examples(self.train, self.initial_pattern)
+        train_flat = get_eval_examples(self.train, self.initial_pattern, self.cfg)
         # print(f"improve vc: {train_flat.type.value_counts().to_dict()}", flush=True)
 
         tp = self.select_for_improve(train_flat, "exact")
@@ -164,7 +164,7 @@ class RegexulatorExplorer:
         
     
     def pattern_improvement(self, new_pattern, metric=None):
-        new_metrics = eval_pattern(self.train, new_pattern)
+        new_metrics = eval_pattern(self.train, new_pattern, self.cfg)
         if metric is None:
             metric = self.cfg.primary_metric
         if new_metrics is None:
@@ -184,9 +184,9 @@ class RegexulatorExplorer:
     def check_compile(self, messages, pattern):
         try:
             if not pattern:
-                raise re.error("No pattern found")
-            re.compile(pattern)
-        except re.error as e:
+                raise regex.error("No pattern found")
+            regex.compile(pattern)
+        except regex.error as e:
             print("check_compile triggered")
             self.log.n_not_compilable += 1
             prompt = self.cfg.prompt_templates.not_compilable.format(error=str(e))
@@ -255,7 +255,7 @@ class RegexulatorExplorer:
             messages=messages,
             options={
                 "num_ctx": self.cfg.llm_num_ctx,
-                "num_predict": 1024,
+                "num_predict": self.cfg.max_predict_tokens,
                 "temperature": self.cfg.llm_temperature
             },
             keep_alive=self.cfg.llm_keep_alive,
@@ -265,7 +265,7 @@ class RegexulatorExplorer:
         return e['message']['content']
 
     def extract_regex(self, response):
-        m = re.search("FINAL REGEX:\s*(.*)", response)
+        m = regex.search("FINAL REGEX:\s*(.*)", response)
         if m is None:
             # fixme ask for final regex
             return None
